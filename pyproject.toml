@@ -1,0 +1,17 @@
+[project]
+name = "iiot-ids-nbaiot"
+version = "0.1.0"
+description = "IIoT Intrusion Detection System using N-BaIoT dataset — Centralized CNN-GRU, Autoencoder, and Federated Learning"
+requires-python = "==3.12.*"
+
+dependencies = [
+    "tensorflow==2.19.0",
+    "scikit-learn",
+    "streamlit",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "plotly",
+]
+
+

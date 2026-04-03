@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+
+# Large files & datasets
+results.zip
+samples/
+
+# Extra / experimental notebooks
+extra notebooks/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# uv / pip
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/

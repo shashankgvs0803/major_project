@@ -1,0 +1,7 @@
+tensorflow==2.19.0
+scikit-learn
+streamlit
+numpy
+pandas
+matplotlib
+plotly
