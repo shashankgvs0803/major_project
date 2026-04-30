@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide",
 )
 
-ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results (1)")
 
 STAGE_HTML = (
     '<div style="display:flex;align-items:center;gap:12px;margin:8px 0 2px">'
@@ -32,12 +32,11 @@ STAGE_HTML = (
 def load_artifacts():
     from tensorflow.keras.models import load_model
     paths = {
-        "centralized": os.path.join(ARTIFACT_DIR, "cnn_gru_ids.keras"),
-        "federated":   os.path.join(ARTIFACT_DIR, "federated_cnn_gru_ids.keras"),
-        "autoencoder": os.path.join(ARTIFACT_DIR, "autoencoder_ids.keras"),
+        "centralized": os.path.join(ARTIFACT_DIR, "cnn_gru_centralized.keras"),
+        "federated":   os.path.join(ARTIFACT_DIR, "cnn_gru_federated.keras"),
+        "autoencoder": os.path.join(ARTIFACT_DIR, "autoencoder.keras"),
         "scaler":      os.path.join(ARTIFACT_DIR, "scaler.pkl"),
         "threshold":   os.path.join(ARTIFACT_DIR, "ae_threshold.pkl"),
-        "label_map":   os.path.join(ARTIFACT_DIR, "label_map.pkl"),
     }
     missing = [k for k, p in paths.items() if not os.path.exists(p)]
     if missing:
@@ -49,7 +48,11 @@ def load_artifacts():
     }
     with open(paths["scaler"],    "rb") as f: scaler    = pickle.load(f)
     with open(paths["threshold"], "rb") as f: threshold = pickle.load(f)
-    with open(paths["label_map"], "rb") as f: label_map = pickle.load(f)
+    label_map_path = os.path.join(ARTIFACT_DIR, "label_map.pkl")
+    if os.path.exists(label_map_path):
+        with open(label_map_path, "rb") as f: label_map = pickle.load(f)
+    else:
+        label_map = {0: "Benign", 1: "Attack"}
     return models, scaler, float(threshold), label_map
 
 
@@ -79,22 +82,37 @@ def run_autoencoder(X_scaled, models, threshold):
     }
 
 
-def run_classifier(X_scaled, ae_result, models, label_map, model_key):
+def run_classifier(X_scaled, ae_result, models, label_map, model_key, mode="parallel"):
     X_3d   = X_scaled.reshape(X_scaled.shape[0], X_scaled.shape[1], 1)
     probs  = models[model_key].predict(X_3d, verbose=0).ravel()
-    preds  = (probs > 0.5).astype(int)
+    cnn_preds = (probs > 0.5).astype(int)   # raw CNN-GRU before AND
+    preds     = cnn_preds.copy()
+
+    # Cascading AND: final Attack only when both AE and CNN-GRU agree
+    if mode == "cascading_and" and ae_result is not None:
+        preds = (preds & ae_result["ae_flags"].astype(int))
+
     labels = np.array([label_map[p] for p in preds])
     conf   = np.where(preds == 1, probs, 1 - probs)
     is_attack = preds == 1
     if ae_result is not None:
         ae_flags   = ae_result["ae_flags"]
-        confidence = np.where(
-            is_attack  & ae_flags,  "High - AE confirmed",
-            np.where(
-            is_attack  & ~ae_flags, "Medium - AE not flagged",
-            np.where(
-            ~is_attack & ae_flags,  "Review - AE flagged benign",
-                                    "Normal")))
+        if mode == "cascading_and":
+            confidence = np.where(
+                is_attack,                              "High - AE + CNN-GRU agreed",
+                np.where(
+                (probs > 0.5) & ~ae_flags,              "Suppressed - AE cleared",
+                np.where(
+                ae_flags & ~(probs > 0.5).astype(bool), "Suppressed - CNN-GRU cleared",
+                                                         "Normal")))
+        else:
+            confidence = np.where(
+                is_attack  & ae_flags,  "High - AE confirmed",
+                np.where(
+                is_attack  & ~ae_flags, "Medium - AE not flagged",
+                np.where(
+                ~is_attack & ae_flags,  "Review - AE flagged benign",
+                                        "Normal")))
     else:
         confidence = np.where(is_attack, "Attack (AE not run)", "Benign (AE not run)")
     n_total   = len(X_scaled)
@@ -102,6 +120,7 @@ def run_classifier(X_scaled, ae_result, models, label_map, model_key):
     return {
         "labels":     labels,
         "preds":      preds,
+        "cnn_preds":  cnn_preds,
         "probs":      probs,
         "conf":       conf,
         "confidence": confidence,
@@ -127,31 +146,56 @@ def _build_ae_stats(ae_result, y_true):
 def _build_stats(result, y_true):
     out = {"metrics": None, "cm": None, "all_classes": None}
     if y_true is not None:
+        cm = confusion_matrix(y_true, result["preds"], labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+        n_benign_true = int((y_true == 0).sum())
         out["metrics"] = {
             "acc":  accuracy_score( y_true, result["preds"]),
             "prec": precision_score(y_true, result["preds"], zero_division=0),
             "rec":  recall_score(   y_true, result["preds"], zero_division=0),
             "f1":   f1_score(       y_true, result["preds"], zero_division=0),
+            "tp":   int(tp),
+            "fp":   int(fp),
+            "fn":   int(fn),
+            "fpr":  fp / n_benign_true if n_benign_true > 0 else 0.0,
         }
         all_classes        = [0, 1]
         out["all_classes"] = ["Benign", "Attack"]
-        out["cm"]          = confusion_matrix(y_true, result["preds"], labels=all_classes)
+        out["cm"]          = cm
     return out
 
 
-def _build_table(result, ae_result, y_true, label_map):
-    table = pd.DataFrame({
-        "Row":        np.arange(1, result["n_total"] + 1),
-        "Prediction": result["labels"],
-        "Conf %":     (result["conf"] * 100).round(1),
-        "Confidence": result["confidence"],
-    })
-    if ae_result is not None:
-        table["AE Flag"]     = np.where(ae_result["ae_flags"], "Anomaly", "Normal")
-        table["Recon Error"] = ae_result["errors"].round(6)
-    if y_true is not None:
-        table["Ground Truth"] = [label_map[v] for v in y_true]
-        table["Correct"]      = (result["preds"] == y_true)
+def _build_table(result, ae_result, y_true, label_map, mode="Parallel"):
+    if mode == "Cascading (AND)" and ae_result is not None:
+        # Per-stage transparent view
+        cnn_labels = np.array([label_map[p] for p in result["cnn_preds"]])
+        table = pd.DataFrame({
+            "Row":                np.arange(1, result["n_total"] + 1),
+            "CNN-GRU Prediction": cnn_labels,
+            "AE Flag":            np.where(ae_result["ae_flags"], "Anomaly", "Normal"),
+            "Final Decision":     result["labels"],
+            "Recon Error":        ae_result["errors"].round(6),
+        })
+        if y_true is not None:
+            table["Ground Truth"] = [label_map[v] for v in y_true]
+            table["Correct"]      = (result["preds"] == y_true)
+        # Reorder to put Ground Truth first if present
+        if y_true is not None:
+            table = table[["Row", "Ground Truth", "CNN-GRU Prediction",
+                           "AE Flag", "Final Decision", "Recon Error", "Correct"]]
+    else:
+        table = pd.DataFrame({
+            "Row":        np.arange(1, result["n_total"] + 1),
+            "Prediction": result["labels"],
+            "Conf %":     (result["conf"] * 100).round(1),
+            "Confidence": result["confidence"],
+        })
+        if ae_result is not None:
+            table["AE Flag"]     = np.where(ae_result["ae_flags"], "Anomaly", "Normal")
+            table["Recon Error"] = ae_result["errors"].round(6)
+        if y_true is not None:
+            table["Ground Truth"] = [label_map[v] for v in y_true]
+            table["Correct"]      = (result["preds"] == y_true)
     return table
 
 
@@ -209,7 +253,7 @@ def render_ae_panel(ae_result, ae_stats):
     st.plotly_chart(fig, use_container_width=True, key="ae_hist")
 
 
-def render_panel(result, title, table, stats):
+def render_panel(result, title, table, stats, mode="Parallel"):
     r      = result
     c1, c2 = st.columns(2)
     c1.metric("Benign", f"{r['n_benign']:,}", f"{r['n_benign']/r['n_total']:.1%}")
@@ -217,10 +261,16 @@ def render_panel(result, title, table, stats):
     if stats["metrics"] is not None:
         m = stats["metrics"]
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Accuracy",  f"{m['acc']:.3f}")
-        m2.metric("Precision", f"{m['prec']:.3f}")
-        m3.metric("Recall",    f"{m['rec']:.3f}")
-        m4.metric("F1",        f"{m['f1']:.3f}")
+        if mode == "Cascading (AND)":
+            m1.metric("Attacks Caught",  f"{m['tp']:,}",   help="True Positives — attacks correctly flagged")
+            m2.metric("False Alarms",    f"{m['fp']:,}",   help="False Positives — benign samples wrongly flagged")
+            m3.metric("Missed Attacks",  f"{m['fn']:,}",   help="False Negatives — attacks that slipped through")
+            m4.metric("False Alarm Rate", f"{m['fpr']:.3f}", help="FP / total benign — fraction of benign traffic wrongly blocked")
+        else:
+            m1.metric("Accuracy",  f"{m['acc']:.3f}")
+            m2.metric("Precision", f"{m['prec']:.3f}")
+            m3.metric("Recall",    f"{m['rec']:.3f}")
+            m4.metric("F1",        f"{m['f1']:.3f}")
     fig = go.Figure()
     fig.add_trace(go.Histogram(
         x=r["probs"][r["preds"] == 0], name="Benign",
@@ -284,13 +334,23 @@ def render_comparison(comp):
 # -- Sidebar --------------------------------------------------
 with st.sidebar:
     st.title("IIoT IDS")
-    st.caption("Binary · Parallel Pipeline")
+    st.divider()
+    mode = st.radio(
+        "Pipeline Mode",
+        options=["Parallel", "Cascading (AND)"],
+        captions=["AE and CNN-GRU run independently",
+                  "Attack only if both AE and CNN-GRU agree"],
+        key="pipeline_mode",
+    )
     st.divider()
     uploaded = st.file_uploader("Upload CSV", type="csv", key="uploader")
 
 # -- Main -----------------------------------------------------
 st.title("IIoT Intrusion Detection System")
-st.caption("Parallel Pipeline: Autoencoder (anomaly detector) + CNN-GRU (classifier) — Binary")
+_mode_caption = ("Cascading AND Pipeline: AE flags → CNN-GRU classifies → Attack only if both agree — Binary"
+                 if mode == "Cascading (AND)" else
+                 "Parallel Pipeline: Autoencoder (anomaly detector) + CNN-GRU (classifier) — Binary")
+st.caption(_mode_caption)
 
 if uploaded is None:
     st.info("Upload a CSV file in the sidebar to get started.")
@@ -298,18 +358,34 @@ if uploaded is None:
 
 X_raw, y_true = load_csv(uploaded)
 
+_PRED_KEYS = ("_res_central", "_res_fed", "_table_central", "_table_fed",
+              "_stats_central", "_stats_fed", "_comp_data")
+
 file_id = f"{uploaded.name}_{uploaded.size}"
 if st.session_state.get("_file_id") != file_id:
     st.session_state["_file_id"] = file_id
-    for k in ("_res_ae", "_res_central", "_res_fed", "_X_scaled",
-              "_table_central", "_table_fed",
-              "_stats_ae", "_stats_central", "_stats_fed", "_comp_data",
-              "_label_map"):
+    for k in ("_res_ae", "_X_scaled", "_stats_ae", "_label_map") + _PRED_KEYS:
         st.session_state.pop(k, None)
+
+# Invalidate predictions when mode changes (AE result is still valid)
+_mode_key = mode
+if st.session_state.get("_active_mode") != _mode_key:
+    st.session_state["_active_mode"] = _mode_key
+    for k in _PRED_KEYS:
+        st.session_state.pop(k, None)
+
+# Invalidate stale stats that are missing new keys (tp/fp/fn/fpr)
+for _sk in ("_stats_central", "_stats_fed"):
+    _s = st.session_state.get(_sk)
+    if _s is not None and _s.get("metrics") is not None and "tp" not in _s["metrics"]:
+        for k in _PRED_KEYS:
+            st.session_state.pop(k, None)
+        break
 
 with st.sidebar:
     st.success(f"**{len(X_raw):,}** samples · {X_raw.shape[1]} features"
                + (" · labels detected" if y_true is not None else ""))
+    st.caption(f"Mode: **{mode}**")
 
 # -- Stage 1: Dataset -----------------------------------------
 st.markdown(STAGE_HTML.format(n=1, title="Dataset Overview"), unsafe_allow_html=True)
@@ -330,37 +406,41 @@ else:
 
 st.divider()
 
-# -- Stage 2: Autoencoder -------------------------------------
-st.markdown(STAGE_HTML.format(n=2, title="Autoencoder Anomaly Detection"), unsafe_allow_html=True)
-st.caption("Shared across both pipelines — reconstruction error flags anomalous traffic")
+# -- Stage 2: Autoencoder (Parallel mode only) ---------------
+if mode == "Parallel":
+    st.markdown(STAGE_HTML.format(n=2, title="Autoencoder Anomaly Detection"), unsafe_allow_html=True)
+    st.caption("Shared across both pipelines — reconstruction error flags anomalous traffic")
 
-if st.button("Run Autoencoder", use_container_width=True, key="btn_ae"):
-    try:
-        models, scaler, threshold, label_map = load_artifacts()
-        st.session_state["_label_map"] = label_map
-        with st.spinner("Running autoencoder..."):
-            X_scaled = scaler.transform(X_raw).astype(np.float32)
-            st.session_state["_X_scaled"] = X_scaled
-            ae_res = run_autoencoder(X_scaled, models, threshold)
-            st.session_state["_res_ae"]   = ae_res
-            st.session_state["_stats_ae"] = _build_ae_stats(ae_res, y_true)
-            for k in ("_res_central", "_res_fed", "_table_central", "_table_fed",
-                      "_stats_central", "_stats_fed", "_comp_data"):
-                st.session_state.pop(k, None)
-    except Exception as e:
-        st.error(f"Failed: {e}")
+    if st.button("Run Autoencoder", use_container_width=True, key="btn_ae"):
+        try:
+            models, scaler, threshold, label_map = load_artifacts()
+            st.session_state["_label_map"] = label_map
+            with st.spinner("Running autoencoder..."):
+                X_scaled = scaler.transform(X_raw).astype(np.float32)
+                st.session_state["_X_scaled"] = X_scaled
+                ae_res = run_autoencoder(X_scaled, models, threshold)
+                st.session_state["_res_ae"]   = ae_res
+                st.session_state["_stats_ae"] = _build_ae_stats(ae_res, y_true)
+                for k in ("_res_central", "_res_fed", "_table_central", "_table_fed",
+                          "_stats_central", "_stats_fed", "_comp_data"):
+                    st.session_state.pop(k, None)
+        except Exception as e:
+            st.error(f"Failed: {e}")
 
-if "_res_ae" in st.session_state:
-    render_ae_panel(st.session_state["_res_ae"], st.session_state.get("_stats_ae"))
+    if "_res_ae" in st.session_state:
+        render_ae_panel(st.session_state["_res_ae"], st.session_state.get("_stats_ae"))
 
-st.divider()
+    st.divider()
 
 # -- Stage 3: CNN-GRU -----------------------------------------
 st.markdown(STAGE_HTML.format(n=3, title="CNN-GRU Classification"), unsafe_allow_html=True)
-st.caption("Centralized (full dataset) vs Federated (FedAvg) — both receive original scaled features")
+if mode == "Cascading (AND)":
+    st.caption("Cascading AND — final Attack label requires both AE anomaly flag AND CNN-GRU Attack prediction")
+else:
+    st.caption("Centralized (full dataset) vs Federated (FedAvg) — both receive original scaled features")
 
 ae_result = st.session_state.get("_res_ae", None)
-if ae_result is None:
+if ae_result is None and mode == "Parallel":
     st.info("Run the Autoencoder above first to enable confidence tags in predictions.")
 
 col_left, col_right = st.columns(2)
@@ -368,7 +448,8 @@ col_left, col_right = st.columns(2)
 with col_left:
     with st.container(border=True):
         st.markdown("## Centralized")
-        if st.button("Predict", use_container_width=True, key="btn_central"):
+        _btn_label_c = "Predict (Centralized)" if mode == "Cascading (AND)" else "Predict"
+        if st.button(_btn_label_c, use_container_width=True, key="btn_central"):
             try:
                 models, scaler, threshold, label_map = load_artifacts()
                 st.session_state["_label_map"] = label_map
@@ -376,9 +457,16 @@ with col_left:
                     if "_X_scaled" not in st.session_state:
                         st.session_state["_X_scaled"] = scaler.transform(X_raw).astype(np.float32)
                     X_scaled = st.session_state["_X_scaled"]
-                    res = run_classifier(X_scaled, ae_result, models, label_map, "centralized")
+                    # In cascading mode, auto-run AE if not already done
+                    if mode == "Cascading (AND)" and "_res_ae" not in st.session_state:
+                        ae_res = run_autoencoder(X_scaled, models, threshold)
+                        st.session_state["_res_ae"]   = ae_res
+                        st.session_state["_stats_ae"] = _build_ae_stats(ae_res, y_true)
+                    ae_result = st.session_state.get("_res_ae", None)
+                    _mode_arg = "cascading_and" if mode == "Cascading (AND)" else "parallel"
+                    res = run_classifier(X_scaled, ae_result, models, label_map, "centralized", _mode_arg)
                     st.session_state["_res_central"]   = res
-                    st.session_state["_table_central"] = _build_table(res, ae_result, y_true, label_map)
+                    st.session_state["_table_central"] = _build_table(res, ae_result, y_true, label_map, mode)
                     st.session_state["_stats_central"] = _build_stats(res, y_true)
                     if "_res_fed" in st.session_state:
                         st.session_state["_comp_data"] = _build_comparison_data(
@@ -390,12 +478,13 @@ with col_left:
         if "_res_central" in st.session_state:
             render_panel(st.session_state["_res_central"], "Centralized",
                          st.session_state["_table_central"],
-                         st.session_state["_stats_central"])
+                         st.session_state["_stats_central"], mode)
 
 with col_right:
     with st.container(border=True):
         st.markdown("## Federated")
-        if st.button("Predict", use_container_width=True, key="btn_fed"):
+        _btn_label_f = "Predict (Federated)" if mode == "Cascading (AND)" else "Predict"
+        if st.button(_btn_label_f, use_container_width=True, key="btn_fed"):
             try:
                 models, scaler, threshold, label_map = load_artifacts()
                 st.session_state["_label_map"] = label_map
@@ -403,9 +492,16 @@ with col_right:
                     if "_X_scaled" not in st.session_state:
                         st.session_state["_X_scaled"] = scaler.transform(X_raw).astype(np.float32)
                     X_scaled = st.session_state["_X_scaled"]
-                    res = run_classifier(X_scaled, ae_result, models, label_map, "federated")
+                    # In cascading mode, auto-run AE if not already done
+                    if mode == "Cascading (AND)" and "_res_ae" not in st.session_state:
+                        ae_res = run_autoencoder(X_scaled, models, threshold)
+                        st.session_state["_res_ae"]   = ae_res
+                        st.session_state["_stats_ae"] = _build_ae_stats(ae_res, y_true)
+                    ae_result = st.session_state.get("_res_ae", None)
+                    _mode_arg = "cascading_and" if mode == "Cascading (AND)" else "parallel"
+                    res = run_classifier(X_scaled, ae_result, models, label_map, "federated", _mode_arg)
                     st.session_state["_res_fed"]   = res
-                    st.session_state["_table_fed"] = _build_table(res, ae_result, y_true, label_map)
+                    st.session_state["_table_fed"] = _build_table(res, ae_result, y_true, label_map, mode)
                     st.session_state["_stats_fed"] = _build_stats(res, y_true)
                     if "_res_central" in st.session_state:
                         st.session_state["_comp_data"] = _build_comparison_data(
@@ -417,7 +513,7 @@ with col_right:
         if "_res_fed" in st.session_state:
             render_panel(st.session_state["_res_fed"], "Federated",
                          st.session_state["_table_fed"],
-                         st.session_state["_stats_fed"])
+                         st.session_state["_stats_fed"], mode)
 
 # -- Stage 4: Comparison --------------------------------------
 if "_res_central" in st.session_state and "_res_fed" in st.session_state:
