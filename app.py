@@ -135,11 +135,14 @@ def _build_ae_stats(ae_result, y_true):
     if y_true is None:
         return None
     flags = ae_result["ae_flags"].astype(int)
+    cm = confusion_matrix(y_true, flags, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    n_benign_true = int((y_true == 0).sum())
     return {
-        "acc":  accuracy_score( y_true, flags),
-        "prec": precision_score(y_true, flags, zero_division=0),
-        "rec":  recall_score(   y_true, flags, zero_division=0),
-        "f1":   f1_score(       y_true, flags, zero_division=0),
+        "tp":  int(tp),
+        "fp":  int(fp),
+        "fn":  int(fn),
+        "fpr": fp / n_benign_true if n_benign_true > 0 else 0.0,
     }
 
 
@@ -232,10 +235,10 @@ def render_ae_panel(ae_result, ae_stats):
     c2.metric("Flagged Anomaly", f"{r['n_flagged']:,}", f"{r['n_flagged']/r['n_total']:.1%}")
     if ae_stats is not None:
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("AE Accuracy",  f"{ae_stats['acc']:.3f}")
-        m2.metric("AE Precision", f"{ae_stats['prec']:.3f}")
-        m3.metric("AE Recall",    f"{ae_stats['rec']:.3f}")
-        m4.metric("AE F1",        f"{ae_stats['f1']:.3f}")
+        m1.metric("AE Attacks Caught",   f"{ae_stats['tp']:,}",    help="True Positives — attacks correctly flagged by AE")
+        m2.metric("AE False Alarms",     f"{ae_stats['fp']:,}",    help="False Positives — benign samples wrongly flagged by AE")
+        m3.metric("AE Missed Attacks",   f"{ae_stats['fn']:,}",    help="False Negatives — attacks that passed through the AE gate")
+        m4.metric("AE False Alarm Rate", f"{ae_stats['fpr']:.3f}", help="FP / total benign — fraction of benign traffic wrongly flagged")
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=r["errors"][~r["ae_flags"]], name="Normal",
                                marker_color="#1a9e60", opacity=0.7, nbinsx=40))
@@ -261,16 +264,10 @@ def render_panel(result, title, table, stats, mode="Parallel"):
     if stats["metrics"] is not None:
         m = stats["metrics"]
         m1, m2, m3, m4 = st.columns(4)
-        if mode == "Cascading (AND)":
-            m1.metric("Attacks Caught",  f"{m['tp']:,}",   help="True Positives — attacks correctly flagged")
-            m2.metric("False Alarms",    f"{m['fp']:,}",   help="False Positives — benign samples wrongly flagged")
-            m3.metric("Missed Attacks",  f"{m['fn']:,}",   help="False Negatives — attacks that slipped through")
-            m4.metric("False Alarm Rate", f"{m['fpr']:.3f}", help="FP / total benign — fraction of benign traffic wrongly blocked")
-        else:
-            m1.metric("Accuracy",  f"{m['acc']:.3f}")
-            m2.metric("Precision", f"{m['prec']:.3f}")
-            m3.metric("Recall",    f"{m['rec']:.3f}")
-            m4.metric("F1",        f"{m['f1']:.3f}")
+        m1.metric("Attacks Caught",   f"{m['tp']:,}",    help="True Positives — attacks correctly flagged")
+        m2.metric("False Alarms",     f"{m['fp']:,}",    help="False Positives — benign samples wrongly flagged")
+        m3.metric("Missed Attacks",   f"{m['fn']:,}",    help="False Negatives — attacks that slipped through")
+        m4.metric("False Alarm Rate", f"{m['fpr']:.3f}", help="FP / total benign — fraction of benign traffic wrongly blocked")
     fig = go.Figure()
     fig.add_trace(go.Histogram(
         x=r["probs"][r["preds"] == 0], name="Benign",
@@ -381,6 +378,11 @@ for _sk in ("_stats_central", "_stats_fed"):
         for k in _PRED_KEYS:
             st.session_state.pop(k, None)
         break
+
+# Invalidate stale AE stats missing new keys
+_ae_s = st.session_state.get("_stats_ae")
+if _ae_s is not None and "tp" not in _ae_s:
+    st.session_state.pop("_stats_ae", None)
 
 with st.sidebar:
     st.success(f"**{len(X_raw):,}** samples · {X_raw.shape[1]} features"
